@@ -556,6 +556,7 @@ class LMGen(StreamingModule[_LMGenState]):
         temp_text: float = 0.7,
         top_k: int = 250,
         top_k_text: int = 25,
+        prefix_prompt: str | None = None,
         cfg_coef: float = 1.,
         check: bool = False,
         condition_tensors: ConditionTensors | None = None,
@@ -576,6 +577,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.temp_text = temp_text
         self.top_k = top_k
         self.top_k_text = top_k_text
+        self.prefix_prompt = prefix_prompt
         self.cfg_coef = cfg_coef
         self.check = check
         self.max_delay = max(
@@ -606,7 +608,34 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.long,
         )
         offsets = torch.zeros(batch_size, device=lm_model.device, dtype=torch.long)
+        offset_cpu = 0
+        # --- START CORRECTED MODIFICATION ---
+        # 2. Modify the cache and offsets tensors directly BEFORE creating the state object
+        if self.prefix_prompt:
+            # Note: We need access to the tokenizer. The best way is to assume it's part of the lm_model.
+            # The original Moshi code doesn't store it there, so you might need to pass it to LMGen's __init__
+            # and store it as self.text_tokenizer. For this example, we assume it's accessible.
+            # We will use self.lm_model.text_emb.tokenizer, which exists in the provided code.
+            prompt_tokens = self.lm_model.text_emb.tokenizer.encode(self.prefix_prompt)
+            prompt_len = len(prompt_tokens)
 
+            if prompt_len > 0:
+                prompt_tokens_tensor = torch.tensor(
+                    prompt_tokens, device=lm_model.device, dtype=torch.long
+                )
+                
+                # Write prompt tokens into the text stream (stream 0) of the cache
+                cache[:, 0, :prompt_len] = prompt_tokens_tensor
+
+                # Fill audio streams with the initial token for the duration of the prompt
+                # Using `initial_token_id` is better than padding for the model's stability.
+                cache[:, 1:, :prompt_len] = self.lm_model.initial_token_id
+
+                # Advance the offset so generation starts after the prompt
+                offsets += prompt_len
+                offset_cpu += prompt_len
+        # --- END CORRECTED MODIFICATION ---
+        
         if self.lm_model.fuser is None:
             assert not self.condition_tensors
             condition_sum = None
@@ -634,7 +663,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
         state = _LMGenState(
             batch_size, lm_model.device, cache, initial, graphed_main, graphed_depth,
-            offsets, condition_sum=condition_sum, condition_cross=condition_cross,
+            offsets, offset_cpu=offset_cpu, condition_sum=condition_sum, condition_cross=condition_cross,
             cfg_is_masked_until=cfg_is_masked_until)
 
         if self.cfg_coef != 1.:
